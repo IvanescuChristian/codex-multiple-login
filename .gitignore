@@ -1,0 +1,12 @@
+# Never commit profile or credential material.
+auth.json
+*.token
+*oauth*
+.env
+.env.*
+.gemini/
+.codex/
+.agy-profiles/
+.codex-profiles/
+.ssh/
+.ssh

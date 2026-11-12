@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Shadows the real `codex` binary (this dir must sit ahead of it on PATH) to
+# add a --login_new <profile> flag: runs that one invocation against an
+# isolated CODEX_HOME so it gets its own saved login, separate from
+# the shared ~/.codex used by every other session/agent. The shared location is not used
+# during a --login_new run, so every other running (or future, flag-less) `codex` is
+# unaffected.
+#
+# Usage:
+#   codex --login_new work         # first time: creates+uses an isolated
+#                                      # profile "work"; sign in once inside
+#   codex --login_new work         # later: reuses that profile's login
+#   codex --login_new              # no name: lists profiles
+#   codex --login_new --list       # profiles + login status
+#   codex --login_new --help       # wrapper-specific help
+#   codex ...                      # no flag: exactly the real codex
+
+set -euo pipefail
+
+PROFILES_DIR="${CODEX_LOGIN_NEW_PROFILES_DIR:-$HOME/.codex-profiles}"
+
+find_real() {
+  local self self_resolved
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  self_resolved="$(readlink -f "$self")"
+
+  # install.sh records the real binary's path at install time.
+  local real_bin_file recorded
+  real_bin_file="$(dirname "$self")/.codex-real-bin"
+  if [[ -f "$real_bin_file" ]]; then
+    recorded="$(<"$real_bin_file")"
+    if [[ -x "$recorded" && "$(readlink -f "$recorded" 2>/dev/null)" != "$self_resolved" ]]; then
+      echo "$recorded"
+      return 0
+    fi
+  fi
+
+  local IFS=:
+  local dir candidate
+  for dir in $PATH; do
+    candidate="$dir/codex"
+    if [[ -x "$candidate" && "$(readlink -f "$candidate" 2>/dev/null)" != "$self_resolved" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  unset IFS
+
+  local fallback_globs=(
+    "$HOME"/.nvm/versions/node/*/bin/codex
+    "$HOME"/.local/share/pnpm/codex
+    "$HOME"/.volta/bin/codex
+    "$HOME"/.local/bin/codex
+    /usr/local/bin/codex
+    /usr/bin/codex
+  )
+  for candidate in "${fallback_globs[@]}"; do
+    if [[ -x "$candidate" && "$(readlink -f "$candidate" 2>/dev/null)" != "$self_resolved" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Resolved BEFORE any HOME override, and always to an absolute path.
+REAL_BIN="$(find_real)" || {
+  echo "codex wrapper: could not find the real codex binary on PATH (besides this wrapper)" >&2
+  exit 1
+}
+
+show_profiles() {
+  if [[ ! -d "$PROFILES_DIR" ]] || [[ -z "$(ls -A "$PROFILES_DIR" 2>/dev/null)" ]]; then
+    echo "No profiles yet. Create one with: codex --login_new <name>"
+    return
+  fi
+  echo "Profiles in $PROFILES_DIR:"
+  local d name status
+  for d in "$PROFILES_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    name="$(basename "$d")"
+    status="not logged in"
+    [[ -f "$d/auth.json" ]] && status="logged in"
+    printf '  %-20s %s\n' "$name" "$status"
+  done
+}
+
+show_help() {
+  cat <<HELP
+codex --login_new <profile> [codex args...]
+    Runs codex under an isolated profile (its own CODEX_HOME with its own auth.json),
+    without touching the shared ~/.codex used by other sessions.
+    First run: run: codex --login_new <profile> login   (add --device-auth on a headless box)
+
+codex --login_new --list
+    Lists saved profiles under $PROFILES_DIR and their login status.
+
+codex --login_new --help
+    Shows this help.
+
+Override the profile base directory with CODEX_LOGIN_NEW_PROFILES_DIR.
+All other codex flags/subcommands pass through untouched.
+HELP
+}
+
+login_new=""
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --login_new|-login_new)
+      if [[ $# -lt 2 || -z "$2" || ( "$2" == -* && "$2" != --list && "$2" != -list && "$2" != --help && "$2" != -help ) ]]; then
+        show_profiles
+        exit 0
+      fi
+      login_new="$2"
+      shift 2
+      ;;
+    --login_new=*|-login_new=*)
+      login_new="${1#*=}"
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+case "$login_new" in
+  --list|-list|list) show_profiles; exit 0 ;;
+  --help|-help|help) show_help; exit 0 ;;
+esac
+
+if [[ -n "$login_new" ]]; then
+  if [[ ! "$login_new" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "codex: invalid profile name '$login_new' (use letters, numbers, ., _, -)" >&2
+    exit 1
+  fi
+  profile_dir="$PROFILES_DIR/$login_new"
+  mkdir -p "$profile_dir"
+  # An explicit path is required: a relative PROFILES_DIR would break once the
+  # child resolves it against its own cwd.
+  profile_dir="$(cd "$profile_dir" && pwd)"
+  if [[ ! -f "$profile_dir/auth.json" ]]; then
+    echo "codex: profile '$login_new' has no saved login yet — run: codex --login_new $login_new login   (add --device-auth on a headless box) (only this profile is affected)." >&2
+  fi
+  exec env CODEX_HOME="$profile_dir" "$REAL_BIN" ${args[@]+"${args[@]}"}
+else
+  exec "$REAL_BIN" ${args[@]+"${args[@]}"}
+fi
